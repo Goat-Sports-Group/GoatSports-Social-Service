@@ -14,11 +14,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.core.annotation.Order;
-import org.springframework.data.domain.Sort;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
@@ -29,6 +29,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -49,7 +50,9 @@ import java.util.UUID;
 @RequiredArgsConstructor
 @ConditionalOnProperty(prefix = "app.demo-data.simulation", name = "enabled", havingValue = "true")
 public class DemoSimulationSeeder implements CommandLineRunner {
-    static final int POST_DAYS = 90;
+    static final int POST_DAYS = DemoPopulation.HISTORY_DAYS;
+    /** Bài trong bấy nhiêu ngày gần nhất vẫn nhận thêm tương tác ở lần chạy sau. */
+    private static final int ENGAGE_DAYS = 2;
     private static final String CREATED_BY = "demo-sim";
 
     private final MongoTemplate mongo;
@@ -96,38 +99,53 @@ public class DemoSimulationSeeder implements CommandLineRunner {
 
     @Override
     public void run(String... args) {
+        seed(LocalDateTime.now());
+    }
+
+    /** Mỗi đêm: thêm bài của ngày mới và tương tác tiếp cho các bài vừa đăng. */
+    @Scheduled(cron = "0 25 0 * * *", zone = "Asia/Ho_Chi_Minh")
+    public void daily() {
+        seed(LocalDateTime.now());
+    }
+
+    /**
+     * Sinh lại toàn bộ {@link #POST_DAYS} ngày, bỏ qua bài đã có (id theo ngày + thứ tự): lần đầu ra đủ lịch sử, các
+     * lần sau chỉ thêm bài mới; tăng số bài mỗi ngày thì các ngày cũ cũng được bổ sung. Bài đăng trong
+     * {@link #ENGAGE_DAYS} ngày gần nhất được tương tác tiếp (thích, bình luận tới sau).
+     */
+    void seed(LocalDateTime now) {
         List<DemoPopulation.Player> players = DemoPopulation.players();
         int network = seedNetwork(players);
-        LocalDate today = LocalDate.now();
+        LocalDate today = now.toLocalDate();
         LocalDate first = today.minusDays(POST_DAYS);
         List<String> authors = players.stream().map(player -> player.userId().toString()).toList();
-        PostEntity latest = mongo.findOne(Query.query(Criteria.where("authorId").in(authors).and("sharedPostId").is(null))
-                .with(Sort.by(Sort.Direction.DESC, "publishedAt")).limit(1), PostEntity.class);
-        LocalDate from = latest == null || latest.getPublishedAt().toLocalDate().isBefore(first)
-                ? first : latest.getPublishedAt().toLocalDate().plusDays(1);
-        if (from.isAfter(today)) {
-            log.info("Dữ liệu mô phỏng cộng đồng: đã đủ tới hôm nay ({} quan hệ mới)", network);
-            return;
-        }
+        Query recentQuery = Query.query(Criteria.where("authorId").in(authors)
+                .and("publishedAt").gte(first.atStartOfDay()));
+        recentQuery.fields().include("_id", "authorId", "sport", "publishedAt", "sharedPostId");
+        List<PostEntity> existing = mongo.find(recentQuery, PostEntity.class);
+        Set<String> existingIds = new HashSet<>();
+        existing.forEach(post -> existingIds.add(post.getPostId()));
+        Map<String, DemoPopulation.Player> byId = new HashMap<>();
+        players.forEach(player -> byId.put(player.userId().toString(), player));
 
-        LocalDateTime now = LocalDateTime.now();
         List<PostEntity> posts = new ArrayList<>();
         List<PostReactionEntity> reactions = new ArrayList<>();
         List<PostCommentEntity> comments = new ArrayList<>();
         int[] activity = players.stream().mapToInt(player -> (int) Math.round(player.bookingsPerWeek() * 10)).toArray();
-        for (LocalDate date = from; !date.isAfter(today); date = date.plusDays(1)) {
+        for (LocalDate date = first; !date.isAfter(today); date = date.plusDays(1)) {
             Random random = DemoPopulation.random(0x9057, date.toEpochDay());
             double progress = (date.toEpochDay() - first.toEpochDay()) / (double) POST_DAYS;
             boolean weekend = date.getDayOfWeek() == DayOfWeek.SATURDAY || date.getDayOfWeek() == DayOfWeek.SUNDAY;
-            int count = (int) Math.round((2 + 6 * progress) * (weekend ? 1.5 : 1) + random.nextGaussian());
-            for (int index = 0; index < Math.max(1, count); index++) {
+            int count = (int) Math.round((4 + 12 * progress) * (weekend ? 1.5 : 1) + random.nextGaussian() * 1.5);
+            for (int index = 0; index < Math.max(2, count); index++) {
+                String postId = id("sim-post", date + "|" + index).toString();
+                if (existingIds.contains(postId)) continue;
                 DemoPopulation.Player author = players.get(DemoPopulation.weighted(random, activity));
                 LocalDateTime publishedAt = date.atTime(6 + random.nextInt(17), random.nextInt(60));
                 if (publishedAt.isAfter(now)) continue;
                 String sport = author.sports().get(author.sports().size() > 1 && random.nextInt(100) < 30 ? 1 : 0);
                 String[] pool = POSTS.get(sport);
                 String content = pool[random.nextInt(pool.length)];
-                String postId = id("sim-post", date + "|" + index).toString();
                 List<String> tags = PostTags.extract(content);
                 posts.add(PostEntity.builder().postId(postId).authorId(author.userId().toString()).content(content)
                         .visibility(random.nextInt(100) < 90 ? PostVisibility.PUBLIC : PostVisibility.FRIENDS)
@@ -135,16 +153,45 @@ public class DemoSimulationSeeder implements CommandLineRunner {
                         .playerCall(content.contains("#timdoi") ? playerCall(random, sport, author, publishedAt, today) : null)
                         .createdAt(publishedAt).updatedAt(publishedAt).publishedAt(publishedAt)
                         .tags(tags).tagKeys(tags.stream().map(PostTags::key).toList()).build());
-                engage(random, players, author, sport, postId, publishedAt, now, posts, reactions, comments);
+                engage(engagementRandom(postId), players, author, sport, postId, publishedAt, now, posts, reactions, comments);
             }
         }
-        mongo.insertAll(posts);
-        mongo.insertAll(reactions);
-        mongo.insertAll(comments);
-        // Ghi thẳng vào DB không phát sự kiện hành vi: cho lượt nạp bù chạy lại để ai-service học được.
-        mongo.remove(Query.query(Criteria.where("_id").is("post-activity-v1")), "activity_backfills");
+        // Bài vừa đăng: tương tác tới sau lần chạy trước (chỉ thêm lượt chưa có).
+        LocalDateTime recent = now.minusDays(ENGAGE_DAYS);
+        List<String> recentIds = new ArrayList<>();
+        for (PostEntity post : existing) {
+            DemoPopulation.Player author = byId.get(post.getAuthorId());
+            if (author == null || post.getSharedPostId() != null || post.getSport() == null
+                    || post.getPublishedAt().isBefore(recent)) continue;
+            recentIds.add(post.getPostId());
+            engage(engagementRandom(post.getPostId()), players, author, post.getSport().name(), post.getPostId(),
+                    post.getPublishedAt(), now, posts, reactions, comments);
+        }
+        if (!recentIds.isEmpty()) {
+            Set<String> seen = new HashSet<>(existingIds);
+            mongo.find(Query.query(Criteria.where("postId").in(recentIds)), PostReactionEntity.class)
+                    .forEach(item -> seen.add(item.getReactionId()));
+            mongo.find(Query.query(Criteria.where("postId").in(recentIds)), PostCommentEntity.class)
+                    .forEach(item -> seen.add(item.getCommentId()));
+            posts.removeIf(post -> seen.contains(post.getPostId()));
+            reactions.removeIf(item -> seen.contains(item.getReactionId()));
+            comments.removeIf(item -> seen.contains(item.getCommentId()));
+        }
+        if (!posts.isEmpty()) mongo.insertAll(posts);
+        if (!reactions.isEmpty()) mongo.insertAll(reactions);
+        if (!comments.isEmpty()) mongo.insertAll(comments);
+        if (!posts.isEmpty() || !reactions.isEmpty()) {
+            // Ghi thẳng vào DB không phát sự kiện hành vi: cho lượt nạp bù chạy lại để ai-service học được.
+            mongo.remove(Query.query(Criteria.where("_id").is("post-activity-v1")), "activity_backfills");
+        }
         log.info("Dữ liệu mô phỏng cộng đồng: {} bài, {} lượt thích/lưu, {} bình luận từ {} tới {} ({} quan hệ mới)",
-                posts.size(), reactions.size(), comments.size(), from, today, network);
+                posts.size(), reactions.size(), comments.size(), first, today, network);
+    }
+
+    /** Tương tác của một bài chỉ phụ thuộc bài đó, nên lần chạy sau sinh lại đúng các lượt cũ và thêm lượt mới tới. */
+    private static Random engagementRandom(String postId) {
+        UUID key = UUID.fromString(postId);
+        return DemoPopulation.random(0xE96A, key.getMostSignificantBits(), key.getLeastSignificantBits());
     }
 
     /** Thích, lưu, bình luận, chia sẻ từ người cùng thành phố và cùng môn là chính; rải trong 2 ngày sau khi đăng. */
@@ -209,15 +256,19 @@ public class DemoSimulationSeeder implements CommandLineRunner {
                 .skillNote("Trình " + author.skill().toLowerCase()).filled(playDate.isBefore(today)).build();
     }
 
-    /** Mỗi người theo dõi 4–12 người cùng thành phố hoặc cùng môn; khoảng 1/3 trong số đó thành bạn bè. */
+    /**
+     * Mỗi người theo dõi 4–12 người cùng thành phố hoặc cùng môn; khoảng 1/3 trong số đó thành bạn bè. Người đã có
+     * quan hệ thì bỏ qua, nên tăng quy mô cộng đồng chỉ sinh thêm cho người mới.
+     */
     private int seedNetwork(List<DemoPopulation.Player> players) {
-        Integer existing = jdbc.queryForObject("select count(*) from follows where created_by = ?", Integer.class, CREATED_BY);
-        if (existing != null && existing > 0) return 0;
+        Set<UUID> linked = new HashSet<>(jdbc.queryForList(
+                "select distinct follower_id from follows where created_by = ?", UUID.class, CREATED_BY));
         List<Object[]> follows = new ArrayList<>();
         List<Object[]> friendships = new ArrayList<>();
         Set<String> friends = new HashSet<>();
         LocalDateTime base = LocalDateTime.now().minusDays(DemoPopulation.HISTORY_DAYS);
         for (DemoPopulation.Player player : players) {
+            if (linked.contains(player.userId())) continue;
             Random random = DemoPopulation.random(0xF011, player.index());
             List<DemoPopulation.Player> near = players.stream()
                     .filter(other -> other != player && (other.city() == player.city()
